@@ -5,13 +5,13 @@
   "description": "MiniBili Xcode Cloud, Telegram and TestFlight automation worker.",
   "type": "module",
   "scripts": {
-    "check": "node --check src/index.js && node --check scripts/backfill-public-rollouts.js && node --check scripts/sync-asc-public-rollouts.js",
+    "check": "node --check src/index.js && node --check scripts/backfill-public-rollouts.js && python3 -c \"from pathlib import Path; compile(Path('scripts/sync_asc_public_rollouts.py').read_text(), 'scripts/sync_asc_public_rollouts.py', 'exec')\"",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:migrate:local": "wrangler d1 migrations apply minibili-testflight --local",
     "db:migrate:remote": "wrangler d1 migrations apply minibili-testflight --remote",
     "backfill": "node scripts/backfill-public-rollouts.js examples/backfill-public-rollouts.sample.json",
-    "sync:asc": "node scripts/sync-asc-public-rollouts.js --since-days=45"
+    "sync:asc": "python3 scripts/sync_asc_public_rollouts.py"
   },
   "devDependencies": {
     "wrangler": "^4.18.0"

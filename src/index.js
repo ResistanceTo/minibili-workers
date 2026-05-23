@@ -3,13 +3,14 @@
  */
 
 const TELEGRAM_API_BASE = "https://api.telegram.org";
-const GITHUB_API_BASE = "https://api.github.com";
-const GITHUB_API_VERSION = "2022-11-28";
 const ASC_API_BASE = "https://api.appstoreconnect.apple.com";
 const XCODE_CLOUD_SECRET_HEADER = "x-xcode-webhook-secret";
 const PUBLIC_ROLLOUT_ADMIN_SECRET_HEADER = "x-public-rollout-admin-secret";
 const PUBLIC_ROLLOUT_TABLE = "testflight_public_rollouts";
 const DEFAULT_PUBLIC_ROLLOUT_LIMIT = 10;
+const DEFAULT_ASC_SYNC_BUILD_LIMIT = 5;
+const ASC_SYNC_CRON = "0 23 * * *";
+const PUBLIC_ROLLOUT_CRON = "0 0 * * *";
 
 export default {
   async fetch(request, env) {
@@ -90,9 +91,66 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(processDuePublicRollouts(env));
+    ctx.waitUntil(runScheduledAutomation(event, env));
   }
 };
+
+async function runScheduledAutomation(event, env) {
+  const cron = event?.cron ?? "";
+  console.log(`[Cron] Triggered | cron=${cron || "manual"}`);
+
+  if (cron === ASC_SYNC_CRON) {
+    await syncLatestAscBuildsToD1(env);
+    return;
+  }
+
+  if (cron === PUBLIC_ROLLOUT_CRON) {
+    await publishDuePublicRollouts(env);
+    return;
+  }
+
+  await syncLatestAscBuildsToD1(env);
+  await publishDuePublicRollouts(env);
+}
+
+async function syncLatestAscBuildsToD1(env) {
+  if (!env.TESTFLIGHT_DB) {
+    console.log("[ASCSync] Skipped: TESTFLIGHT_DB binding is missing.");
+    return;
+  }
+
+  const appId = env.ASC_APP_ID;
+  if (!appId) {
+    console.log("[ASCSync] Skipped: ASC_APP_ID is missing.");
+    return;
+  }
+
+  try {
+    validatePublicRolloutConfig(env);
+    const token = await createAppStoreConnectJWT(env);
+    const buildLimit = positiveInt(env.ASC_SYNC_BUILD_LIMIT, DEFAULT_ASC_SYNC_BUILD_LIMIT);
+    const builds = await fetchLatestAscBuilds({ token, appId, limit: buildLimit });
+    const groups = await fetchExternalBetaGroups({ token, appId });
+    const groupBuilds = await fetchBuildsForGroups({ token, groups });
+    const membershipsByBuildId = indexGroupMemberships(groups, groupBuilds);
+
+    console.log(`[ASCSync] Sync started | app=${appId} | builds=${builds.length} | groups=${groups.length} | buildLimit=${buildLimit}`);
+
+    for (const build of builds) {
+      await upsertPublicRolloutJobFromAscBuild({
+        env,
+        token,
+        appId,
+        build,
+        memberships: membershipsByBuildId.get(build.id) ?? []
+      });
+    }
+
+    console.log(`[ASCSync] Sync completed | app=${appId} | builds=${builds.length}`);
+  } catch (error) {
+    console.log(`[ASCSync] Failed | error=${error?.message ?? error}`);
+  }
+}
 
 async function safeCreatePublicRolloutJob(payload, summary, env) {
   try {
@@ -112,23 +170,23 @@ function isBuildFinished(payload) {
 async function buildSummary(payload, env) {
   const buildRunAttr = payload?.ciBuildRun?.attributes ?? {};
   const gitReferenceAttr = payload?.scmGitReference?.attributes ?? {};
-  const repositoryAttr = payload?.scmRepository?.attributes ?? {};
-  const appName = env.APP_NAME ?? payload?.ciProduct?.attributes?.name ?? "应用";
+  const appName = shareholderAppName(env, payload?.ciProduct?.attributes?.name);
   const buildNumber = buildRunAttr.number ?? "未知";
   const status = normalizeStatus(buildRunAttr.completionStatus);
   const workflowName = payload?.ciWorkflow?.attributes?.name ?? "";
 
   const tagName = gitReferenceAttr.name;
-  const owner = repositoryAttr.ownerName;
-  const repo = repositoryAttr.repositoryName;
+  const appId = payload?.app?.id;
 
   console.log(
-    `[GitHub] Resolving notes | repo=${owner ?? "missing"}/${repo ?? "missing"} | tag=${tagName ?? "missing"} | token=${env.GITHUB_TOKEN ? "present" : "missing"}`
+    `[ASC] Resolving notes | app=${appId ?? "missing"} | build=${buildNumber} | tag=${tagName ?? "missing"} | ascToken=${hasAppStoreConnectConfig(env) ? "available" : "missing"}`
   );
 
-  const tagNotes = await fetchTagReleaseNotes({ owner, repo, tagName, token: env.GITHUB_TOKEN });
+  const ascBuildInfo = status === "SUCCEEDED"
+    ? await fetchAscBuildNotesInfo({ env, appId, buildNumber })
+    : null;
   const commitMsg = normalizeReleaseNotes(buildRunAttr.sourceCommit?.message ?? "");
-  const whatsNewLog = tagNotes?.text || commitMsg;
+  const whatsNewLog = ascBuildInfo?.notes || commitMsg;
 
   const eventDate = payload?.metadata?.attributes?.createdDate ?? buildRunAttr.finishedDate;
 
@@ -139,13 +197,22 @@ async function buildSummary(payload, env) {
     workflowName,
     tagName,
     whatsNewLog,
-    whatsNewSource: tagNotes ? tagNotes.source : commitMsg ? "source_commit" : "fallback",
+    whatsNewSource: ascBuildInfo?.notes ? "asc_beta_build_localization" : commitMsg ? "source_commit" : "fallback",
     whatsNewLength: whatsNewLog.length,
+    ascBuildId: ascBuildInfo?.buildId ?? null,
     eventDate
   };
 }
 
 async function maybeCreatePublicRolloutJob(payload, summary, env) {
+  if (env.PUBLIC_ROLLOUT_SCHEDULE_FROM_WEBHOOK !== "true") {
+    return {
+      enabled: true,
+      source: "asc_scheduled_sync",
+      reason: "webhook_does_not_include_testflight_group_membership"
+    };
+  }
+
   if (summary.status !== "SUCCEEDED") {
     return { enabled: false, reason: "build_not_succeeded" };
   }
@@ -179,11 +246,11 @@ async function maybeCreatePublicRolloutJob(payload, summary, env) {
     appId,
     buildRunId,
     buildNumber: summary.buildNumber,
-    ascBuildId: null,
     workflowName: summary.workflowName,
     tagName: summary.tagName ?? "",
     appName: summary.appName,
     notes: summary.whatsNewLog,
+    ascBuildId: summary.ascBuildId,
     releaseAtValue: payload?.ciBuildRun?.attributes?.finishedDate ?? summary.eventDate
   });
 
@@ -219,8 +286,8 @@ async function handlePublicRolloutBackfill(request, rawBody, env) {
     try {
       const normalized = await normalizeBackfillEntry(entry, env);
       const result = await upsertPublicRolloutJob({ env, ...normalized });
-      results.push({ ok: true, id: normalized.id, dueAt: result.dueAt });
-      console.log(`[PublicRollout] Backfilled | id=${normalized.id} | build=${normalized.buildNumber} | dueAt=${result.dueAt}`);
+      results.push({ ok: true, id: normalized.id, status: normalized.status ?? "SCHEDULED", dueAt: result.dueAt });
+      console.log(`[PublicRollout] Backfilled | id=${normalized.id} | build=${normalized.buildNumber} | status=${normalized.status ?? "SCHEDULED"} | dueAt=${result.dueAt}`);
     } catch (error) {
       const message = error?.message ?? String(error);
       results.push({ ok: false, error: message });
@@ -251,12 +318,14 @@ async function normalizeBackfillEntry(entry, env) {
       appId,
       buildRunId,
       buildNumber: summary.buildNumber,
-      ascBuildId: null,
+      ascBuildId: summary.ascBuildId,
       workflowName: summary.workflowName,
       tagName: summary.tagName ?? "",
       appName: summary.appName,
       notes: summary.whatsNewLog,
-      releaseAtValue: payload?.ciBuildRun?.attributes?.finishedDate ?? summary.eventDate
+      releaseAtValue: payload?.ciBuildRun?.attributes?.finishedDate ?? summary.eventDate,
+      status: "SCHEDULED",
+      lastError: null
     };
   }
 
@@ -269,6 +338,8 @@ async function normalizeBackfillEntry(entry, env) {
     throw new Error("Backfill item requires id/buildRunId, appId, buildNumber, and releaseAt");
   }
 
+  const buildState = classifyBackfillBuild(entry);
+
   return {
     id,
     appId,
@@ -279,23 +350,57 @@ async function normalizeBackfillEntry(entry, env) {
     tagName: entry?.tagName ?? "",
     appName: entry?.appName ?? env.APP_NAME ?? "应用",
     notes: normalizeReleaseNotes(entry?.notes ?? ""),
-    releaseAtValue
+    releaseAtValue,
+    status: entry?.status ?? buildState.status,
+    lastError: entry?.lastError ?? entry?.last_error ?? buildState.lastError,
+    shareholderGroupsJson: normalizeGroupsJson(entry?.shareholderGroupsJson ?? entry?.shareholder_groups_json ?? entry?.shareholderGroups),
+    targetGroupsJson: normalizeTargetGroupsJson(entry?.targetGroupsJson ?? entry?.target_groups_json ?? entry?.targetGroups)
   };
 }
 
-async function upsertPublicRolloutJob({ env, id, appId, buildRunId, buildNumber, ascBuildId, workflowName, tagName, appName, notes, releaseAtValue }) {
+function classifyBackfillBuild(entry) {
+  const expired = entry?.expired === true || upper(entry?.expired) === "TRUE";
+  if (expired) {
+    return {
+      status: "SKIPPED_EXPIRED",
+      lastError: "Build is expired in App Store Connect"
+    };
+  }
+
+  const processingState = upper(entry?.processingState);
+  if (processingState && processingState !== "VALID") {
+    return {
+      status: "SKIPPED_PROCESSING_STATE",
+      lastError: `Build processingState is ${processingState}`
+    };
+  }
+
+  return { status: "SCHEDULED", lastError: null };
+}
+
+function normalizeTargetGroupsJson(value) {
+  return normalizeGroupsJson(value);
+}
+
+function normalizeGroupsJson(value) {
+  if (!value) return null;
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
+}
+
+async function upsertPublicRolloutJob({ env, id, appId, buildRunId, buildNumber, ascBuildId, workflowName, tagName, appName, notes, releaseAtValue, status = "SCHEDULED", lastError = null, shareholderGroupsJson = null, targetGroupsJson = null }) {
   const releaseAt = toIsoDate(releaseAtValue);
   const dueAt = addDays(releaseAt, rolloutDelayDays(env)).toISOString();
   const now = new Date().toISOString();
-  const releaseNotes = normalizeReleaseNotes(notes) || "修复了一些已知问题，提升整体流畅度。";
+  const releaseNotes = normalizeReleaseNotes(notes);
 
   await env.TESTFLIGHT_DB.prepare(`
     INSERT INTO ${PUBLIC_ROLLOUT_TABLE} (
       id, app_id, build_run_id, ci_build_number, asc_build_id, workflow_name, tag_name,
-      app_name, notes, release_at, due_at, status, target_groups_json, attempts,
+      app_name, notes, release_at, due_at, status, shareholder_groups_json, target_groups_json, attempts,
       last_error, telegram_message_id, created_at, updated_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', NULL, 0, NULL, NULL, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       app_id = excluded.app_id,
       ci_build_number = excluded.ci_build_number,
@@ -306,6 +411,10 @@ async function upsertPublicRolloutJob({ env, id, appId, buildRunId, buildNumber,
       notes = excluded.notes,
       release_at = excluded.release_at,
       due_at = excluded.due_at,
+      status = CASE WHEN status = 'DONE' THEN status ELSE excluded.status END,
+      shareholder_groups_json = COALESCE(excluded.shareholder_groups_json, shareholder_groups_json),
+      target_groups_json = COALESCE(excluded.target_groups_json, target_groups_json),
+      last_error = CASE WHEN status = 'DONE' THEN last_error ELSE excluded.last_error END,
       updated_at = excluded.updated_at
   `).bind(
     id,
@@ -319,6 +428,10 @@ async function upsertPublicRolloutJob({ env, id, appId, buildRunId, buildNumber,
     releaseNotes,
     releaseAt.toISOString(),
     dueAt,
+    status,
+    shareholderGroupsJson,
+    targetGroupsJson,
+    lastError,
     now,
     now
   ).run();
@@ -333,91 +446,7 @@ function shouldSkipEmptyTaggedSuccess(summary) {
     && !summary.whatsNewLog;
 }
 
-async function fetchTagReleaseNotes({ owner, repo, tagName, token }) {
-  const annotatedTagMessage = await fetchAnnotatedTagMessage({ owner, repo, tagName, token });
-  if (annotatedTagMessage) {
-    return { source: "annotated_tag", text: annotatedTagMessage };
-  }
-
-  const githubReleaseNotes = await fetchGitHubReleaseNotes({ owner, repo, tagName, token });
-  if (githubReleaseNotes) {
-    return { source: "github_release", text: githubReleaseNotes };
-  }
-
-  return null;
-}
-
-async function fetchAnnotatedTagMessage({ owner, repo, tagName, token }) {
-  if (!owner || !repo || !tagName || !token) {
-    return "";
-  }
-
-  try {
-    const tagRef = await fetchGitHubJSON(
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/tags/${encodeURIComponent(tagName)}`,
-      token
-    );
-
-    if (tagRef?.object?.type !== "tag" || !tagRef.object.sha) {
-      console.log(`[GitHub] Tag ${tagName} is not an annotated tag; falling back.`);
-      return "";
-    }
-
-    const tagObject = await fetchGitHubJSON(
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/tags/${encodeURIComponent(tagRef.object.sha)}`,
-      token
-    );
-
-    const message = normalizeReleaseNotes(tagObject?.message ?? "");
-    console.log(`[GitHub] Annotated tag message loaded | length=${message.length}`);
-    return message;
-  } catch (error) {
-    console.log(`[GitHub] Failed to fetch annotated tag message for ${owner}/${repo}@${tagName}: ${error?.message ?? error}`);
-    return "";
-  }
-}
-
-async function fetchGitHubReleaseNotes({ owner, repo, tagName, token }) {
-  if (!owner || !repo || !tagName || !token) {
-    return "";
-  }
-
-  try {
-    const release = await fetchGitHubJSON(
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/tags/${encodeURIComponent(tagName)}`,
-      token
-    );
-
-    const notes = normalizeReleaseNotes(release?.body ?? release?.name ?? "");
-    console.log(`[GitHub] Release notes loaded | id=${release?.id ?? "missing"} | draft=${String(release?.draft ?? false)} | prerelease=${String(release?.prerelease ?? false)} | length=${notes.length}`);
-    return notes;
-  } catch (error) {
-    console.log(`[GitHub] Failed to fetch release notes for ${owner}/${repo}@${tagName}: ${error?.message ?? error}`);
-    return "";
-  }
-}
-
-async function fetchGitHubJSON(path, token) {
-  const response = await fetch(`${GITHUB_API_BASE}${path}`, {
-    headers: {
-      "Accept": "application/vnd.github+json",
-      "Authorization": `Bearer ${token}`,
-      "User-Agent": "MiniBili-XcodeCloud-Telegram-Worker",
-      "X-GitHub-Api-Version": GITHUB_API_VERSION
-    }
-  });
-
-  const requestId = response.headers.get("x-github-request-id") ?? "none";
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`GitHub API ${response.status} ${response.statusText} | requestId=${requestId}${body ? ` | ${body.slice(0, 300)}` : ""}`);
-  }
-
-  return response.json();
-}
-
-async function processDuePublicRollouts(env) {
+async function publishDuePublicRollouts(env) {
   if (!env.TESTFLIGHT_DB) {
     console.log("[PublicRollout] Skipped cron: TESTFLIGHT_DB binding is missing.");
     return;
@@ -459,15 +488,27 @@ async function processPublicRolloutJob(env, job) {
 
     const token = await createAppStoreConnectJWT(env);
     const build = job.asc_build_id
-      ? { id: job.asc_build_id }
+      ? await fetchAscBuildById({ token, buildId: job.asc_build_id })
       : await fetchAscBuildByVersion({ token, appId: job.app_id, buildNumber: job.ci_build_number });
 
+    if (build?.attributes?.expired === true) {
+      await updatePublicRolloutJob(env, job.id, {
+        status: "SKIPPED_EXPIRED",
+        asc_build_id: build.id,
+        last_error: "Build is expired in App Store Connect",
+        updated_at: new Date().toISOString()
+      });
+      console.log(`[PublicRollout] Skipped expired build | id=${job.id} | buildId=${build.id}`);
+      return;
+    }
+
+    const notes = normalizeReleaseNotes(job.notes)
+      || await fetchAscBuildNotes({ token, buildId: build.id });
     const betaGroups = await fetchExternalBetaGroups({ token, appId: job.app_id });
-    const shareholderName = env.ASC_SHAREHOLDER_GROUP_NAME ?? "股东";
-    const targetGroups = betaGroups.filter((group) => group.attributes?.name !== shareholderName);
+    const targetGroups = selectPublicTargetGroups(betaGroups, env);
 
     if (targetGroups.length === 0) {
-      throw new Error(`No external beta groups found after excluding ${shareholderName}.`);
+      throw new Error("No external beta groups found after excluding shareholder groups.");
     }
 
     if (env.ASC_DRY_RUN === "true") {
@@ -482,17 +523,15 @@ async function processPublicRolloutJob(env, job) {
     })));
 
     let telegramMessageId = job.telegram_message_id ?? null;
-    if (env.ASC_DRY_RUN !== "true" && env.PUBLIC_TELEGRAM_CHAT_ID) {
-      const telegramResult = await sendTelegramMessage(env, formatPublicRolloutMessage(job, targetGroups), {
-        chatId: env.PUBLIC_TELEGRAM_CHAT_ID,
-        threadId: env.PUBLIC_TELEGRAM_THREAD_ID
-      });
-      telegramMessageId = telegramResult?.result?.message_id ?? null;
+    if (env.ASC_DRY_RUN !== "true") {
+      const telegramResults = await sendPublicTelegramAnnouncements(env, formatPublicRolloutMessage({ ...job, notes }, targetGroups));
+      telegramMessageId = telegramResults[0]?.result?.message_id ?? null;
     }
 
     await updatePublicRolloutJob(env, job.id, {
       status: env.ASC_DRY_RUN === "true" ? "SCHEDULED" : "DONE",
       asc_build_id: build.id,
+      notes,
       target_groups_json: targetGroupsJson,
       last_error: null,
       telegram_message_id: telegramMessageId,
@@ -524,6 +563,43 @@ async function processPublicRolloutJob(env, job) {
       });
     }
   }
+}
+
+async function sendPublicTelegramAnnouncements(env, message) {
+  const targets = publicTelegramTargets(env);
+  const results = [];
+
+  for (const target of targets) {
+    const result = await sendTelegramMessage(env, message, target);
+    results.push(result);
+    console.log(`[Telegram] Public announcement sent | target=${target.name} | chatId=${target.chatId} | messageId=${result?.result?.message_id ?? "unknown"}`);
+  }
+
+  return results;
+}
+
+function publicTelegramTargets(env) {
+  const targets = [];
+  if (env.PUBLIC_TELEGRAM_CHAT_ID) {
+    targets.push({
+      name: "public_group",
+      chatId: env.PUBLIC_TELEGRAM_CHAT_ID,
+      threadId: env.PUBLIC_TELEGRAM_THREAD_ID,
+      pin: env.PUBLIC_TELEGRAM_PIN_MESSAGE === "true",
+      disablePinNotification: env.PUBLIC_TELEGRAM_PIN_DISABLE_NOTIFICATION !== "false"
+    });
+  }
+
+  if (env.PUBLIC_TELEGRAM_CHANNEL_ID) {
+    targets.push({
+      name: "public_channel",
+      chatId: env.PUBLIC_TELEGRAM_CHANNEL_ID,
+      pin: env.PUBLIC_TELEGRAM_CHANNEL_PIN_MESSAGE === "true",
+      disablePinNotification: env.PUBLIC_TELEGRAM_CHANNEL_PIN_DISABLE_NOTIFICATION !== "false"
+    });
+  }
+
+  return targets;
 }
 
 async function updatePublicRolloutJob(env, id, fields) {
@@ -561,12 +637,168 @@ function validatePublicRolloutConfig(env) {
   }
 }
 
+function hasAppStoreConnectConfig(env) {
+  return Boolean(env.ASC_ISSUER_ID && env.ASC_KEY_ID && env.ASC_PRIVATE_KEY);
+}
+
+async function fetchLatestAscBuilds({ token, appId, limit }) {
+  let url = `/v1/builds?${new URLSearchParams({
+    "filter[app]": appId,
+    "sort": "-uploadedDate",
+    "limit": String(limit),
+    "fields[builds]": "version,uploadedDate,processingState,expired"
+  }).toString()}`;
+  const json = await fetchAscJSON(url, token);
+  return json?.data ?? [];
+}
+
+async function fetchBuildsForGroups({ token, groups }) {
+  const result = new Map();
+  for (const group of groups) {
+    const builds = [];
+    let url = `/v1/betaGroups/${encodeURIComponent(group.id)}/builds?${new URLSearchParams({
+      "limit": "200",
+      "fields[builds]": "version,uploadedDate,processingState,expired"
+    }).toString()}`;
+
+    while (url) {
+      const json = await fetchAscJSON(url, token);
+      builds.push(...(json?.data ?? []));
+      url = nextAscPath(json?.links?.next);
+    }
+
+    result.set(group.id, builds);
+  }
+  return result;
+}
+
+function indexGroupMemberships(groups, groupBuilds) {
+  const memberships = new Map();
+  const groupsById = new Map(groups.map((group) => [group.id, group]));
+
+  for (const [groupId, builds] of groupBuilds.entries()) {
+    const group = groupsById.get(groupId);
+    for (const build of builds) {
+      if (!build?.id) continue;
+      const groupInfo = {
+        id: groupId,
+        name: group?.attributes?.name ?? ""
+      };
+      const current = memberships.get(build.id) ?? [];
+      current.push(groupInfo);
+      memberships.set(build.id, current);
+    }
+  }
+
+  return memberships;
+}
+
+async function upsertPublicRolloutJobFromAscBuild({ env, token, appId, build, memberships }) {
+  const attrs = build?.attributes ?? {};
+  const buildNumber = attrs.version;
+  const releaseAtValue = attrs.uploadedDate;
+  if (!build?.id || !buildNumber || !releaseAtValue) {
+    console.log(`[ASCSync] Skipped malformed build | buildId=${build?.id ?? "missing"}`);
+    return;
+  }
+
+  const shareholderGroups = selectShareholderMemberships(memberships, env);
+  const targetGroups = selectPublicMemberships(memberships, env);
+  const state = classifyAscBuildForRollout(attrs, shareholderGroups, targetGroups);
+  const notes = await fetchAscBuildNotes({ token, buildId: build.id });
+
+  const result = await upsertPublicRolloutJob({
+    env,
+    id: `asc-${build.id}`,
+    appId,
+    buildRunId: `asc-${build.id}`,
+    buildNumber,
+    ascBuildId: build.id,
+    workflowName: "asc-scheduled-sync",
+    tagName: "",
+    appName: publicAppName(env),
+    notes,
+    releaseAtValue,
+    status: state.status,
+    lastError: state.lastError,
+    shareholderGroupsJson: normalizeGroupsJson(shareholderGroups),
+    targetGroupsJson: normalizeGroupsJson(targetGroups)
+  });
+
+  console.log(`[ASCSync] Upserted | build=${buildNumber} | buildId=${build.id} | status=${state.status} | shareholderGroups=${shareholderGroups.length} | publicGroups=${targetGroups.length} | dueAt=${result.dueAt}`);
+}
+
+function classifyAscBuildForRollout(attrs, shareholderGroups, targetGroups) {
+  if (attrs.expired === true) {
+    return {
+      status: "SKIPPED_EXPIRED",
+      lastError: "Build is expired in App Store Connect"
+    };
+  }
+
+  const processingState = upper(attrs.processingState);
+  if (processingState && processingState !== "VALID") {
+    return {
+      status: "SKIPPED_PROCESSING_STATE",
+      lastError: `Build processingState is ${processingState}`
+    };
+  }
+
+  if (targetGroups.length > 0) {
+    return { status: "DONE", lastError: null };
+  }
+
+  if (shareholderGroups.length === 0) {
+    return {
+      status: "SKIPPED_NOT_SHAREHOLDER",
+      lastError: "Build is not assigned to shareholder group"
+    };
+  }
+
+  return { status: "SCHEDULED", lastError: null };
+}
+
+function selectShareholderMemberships(memberships, env) {
+  const shareholderName = env.ASC_SHAREHOLDER_GROUP_NAME ?? "股东";
+  const shareholderIds = new Set(parseList(env.ASC_SHAREHOLDER_GROUP_ID));
+  return memberships.filter((group) => group.name === shareholderName || shareholderIds.has(group.id));
+}
+
+function selectPublicMemberships(memberships, env) {
+  const shareholderName = env.ASC_SHAREHOLDER_GROUP_NAME ?? "股东";
+  const shareholderIds = new Set(parseList(env.ASC_SHAREHOLDER_GROUP_ID));
+  return memberships.filter((group) => group.name !== shareholderName && !shareholderIds.has(group.id));
+}
+
+async function fetchAscBuildNotesInfo({ env, appId, buildNumber }) {
+  if (!appId || !buildNumber) {
+    console.log("[ASC] Notes skipped: missing app id or build number.");
+    return null;
+  }
+
+  if (!hasAppStoreConnectConfig(env)) {
+    console.log("[ASC] Notes skipped: App Store Connect config is incomplete.");
+    return null;
+  }
+
+  try {
+    const token = await createAppStoreConnectJWT(env);
+    const build = await fetchAscBuildByVersion({ token, appId, buildNumber });
+    const notes = await fetchAscBuildNotes({ token, buildId: build.id });
+    return { buildId: build.id, notes };
+  } catch (error) {
+    console.log(`[ASC] Failed to resolve build notes | app=${appId} | build=${buildNumber} | error=${error?.message ?? error}`);
+    return null;
+  }
+}
+
 async function fetchAscBuildByVersion({ token, appId, buildNumber }) {
   const params = new URLSearchParams({
     "filter[app]": appId,
     "filter[version]": String(buildNumber),
     "sort": "-uploadedDate",
-    "limit": "1"
+    "limit": "1",
+    "fields[builds]": "version,uploadedDate,processingState,expired"
   });
 
   const json = await fetchAscJSON(`/v1/builds?${params.toString()}`, token);
@@ -575,8 +807,51 @@ async function fetchAscBuildByVersion({ token, appId, buildNumber }) {
     throw new Error(`App Store Connect build not found for app=${appId}, version=${buildNumber}`);
   }
 
-  console.log(`[ASC] Build resolved | app=${appId} | version=${buildNumber} | buildId=${build.id}`);
+  console.log(`[ASC] Build resolved | app=${appId} | version=${buildNumber} | buildId=${build.id} | expired=${String(build.attributes?.expired ?? false)} | processing=${build.attributes?.processingState ?? "unknown"}`);
   return build;
+}
+
+async function fetchAscBuildById({ token, buildId }) {
+  const params = new URLSearchParams({
+    "fields[builds]": "version,uploadedDate,processingState,expired"
+  });
+  const json = await fetchAscJSON(`/v1/builds/${encodeURIComponent(buildId)}?${params.toString()}`, token);
+  const build = json?.data;
+  if (!build?.id) {
+    throw new Error(`App Store Connect build not found for id=${buildId}`);
+  }
+
+  console.log(`[ASC] Build loaded | buildId=${build.id} | expired=${String(build.attributes?.expired ?? false)} | processing=${build.attributes?.processingState ?? "unknown"}`);
+  return build;
+}
+
+async function fetchAscBuildNotes({ token, buildId }) {
+  const params = new URLSearchParams({
+    "limit": "200",
+    "fields[betaBuildLocalizations]": "whatsNew,locale,build"
+  });
+  const json = await fetchAscJSON(`/v1/builds/${encodeURIComponent(buildId)}/betaBuildLocalizations?${params.toString()}`, token);
+  const notes = chooseLocalizedNotes(json?.data ?? []);
+  console.log(`[ASC] Build notes loaded | buildId=${buildId} | localizations=${json?.data?.length ?? 0} | notesLength=${notes.length}`);
+  return notes;
+}
+
+function chooseLocalizedNotes(localizations) {
+  const notesByLocale = new Map();
+  for (const item of localizations ?? []) {
+    const locale = item?.attributes?.locale;
+    const notes = normalizeReleaseNotes(item?.attributes?.whatsNew ?? "");
+    if (locale && notes) {
+      notesByLocale.set(locale, notes);
+    }
+  }
+
+  for (const locale of ["zh-Hans", "zh-Hant", "zh", "en-US", "en"]) {
+    const notes = notesByLocale.get(locale);
+    if (notes) return notes;
+  }
+
+  return notesByLocale.values().next().value ?? "";
 }
 
 async function fetchExternalBetaGroups({ token, appId }) {
@@ -595,6 +870,18 @@ async function fetchExternalBetaGroups({ token, appId }) {
 
   console.log(`[ASC] External beta groups loaded | app=${appId} | count=${groups.length}`);
   return groups;
+}
+
+function selectPublicTargetGroups(groups, env) {
+  const shareholderName = env.ASC_SHAREHOLDER_GROUP_NAME ?? "股东";
+  const shareholderIds = new Set(parseList(env.ASC_SHAREHOLDER_GROUP_ID));
+  const targets = groups.filter((group) => {
+    const name = group.attributes?.name ?? "";
+    return name !== shareholderName && !shareholderIds.has(group.id);
+  });
+
+  console.log(`[ASC] Target groups selected | excludedName=${shareholderName} | excludedIds=${[...shareholderIds].join(",") || "none"} | count=${targets.length}`);
+  return targets;
 }
 
 async function addBuildToBetaGroups({ token, buildId, groups }) {
@@ -681,6 +968,11 @@ async function importP8PrivateKey(value) {
 function normalizeReleaseNotes(value) {
   return String(value ?? "")
     .replace(/\\n/g, "\n")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
@@ -726,6 +1018,33 @@ async function sendTelegramMessage(env, text, options = {}) {
   const result = await response.json().catch(() => null);
   if (!response.ok || result?.ok === false) {
     throw new Error(`Telegram API ${response.status} ${response.statusText}: ${JSON.stringify(result)}`);
+  }
+
+  if (options.pin === true && result?.result?.message_id) {
+    await pinTelegramMessage(env, {
+      chatId: body.chat_id,
+      messageId: result.result.message_id,
+      disableNotification: options.disablePinNotification !== false
+    });
+  }
+
+  return result;
+}
+
+async function pinTelegramMessage(env, { chatId, messageId, disableNotification }) {
+  const response = await fetch(`${TELEGRAM_API_BASE}/bot${env.TELEGRAM_BOT_TOKEN}/pinChatMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      disable_notification: disableNotification
+    })
+  });
+
+  const result = await response.json().catch(() => null);
+  if (!response.ok || result?.ok === false) {
+    throw new Error(`Telegram pinChatMessage ${response.status} ${response.statusText}: ${JSON.stringify(result)}`);
   }
 
   return result;
@@ -801,6 +1120,14 @@ function parseList(value) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function shareholderAppName(env, fallback) {
+  return env.SHAREHOLDER_APP_NAME ?? env.APP_NAME ?? fallback ?? "应用";
+}
+
+function publicAppName(env) {
+  return env.PUBLIC_APP_NAME ?? env.APP_NAME ?? "应用";
 }
 
 function rolloutDelayDays(env) {

@@ -1,0 +1,2 @@
+ALTER TABLE testflight_public_rollouts
+ADD COLUMN shareholder_groups_json TEXT;

@@ -7,17 +7,25 @@ enabled = true
 
 [vars]
 APP_NAME = "MiniBili"
+SHAREHOLDER_APP_NAME = "MiniBili-先行版"
+PUBLIC_APP_NAME = "MiniBili-公测版"
 ANNOUNCE_ONLY_SUCCESS = "true"
 ASC_DELAY_DAYS = "30"
+ASC_SYNC_BUILD_LIMIT = "5"
 ASC_SHAREHOLDER_GROUP_NAME = "股东"
+ASC_SHAREHOLDER_GROUP_ID = "5f4a732a-5922-4e23-b259-ac59519c65be"
 PUBLIC_ROLLOUT_LIMIT = "10"
 PUBLIC_ROLLOUT_MAX_ATTEMPTS = "10"
 PUBLIC_ROLLOUT_WORKFLOW_NAMES = "测试专员构建"
+PUBLIC_TELEGRAM_PIN_MESSAGE = "false"
+PUBLIC_TELEGRAM_PIN_DISABLE_NOTIFICATION = "true"
+PUBLIC_TELEGRAM_CHANNEL_PIN_MESSAGE = "false"
+PUBLIC_TELEGRAM_CHANNEL_PIN_DISABLE_NOTIFICATION = "true"
 
 [[d1_databases]]
 binding = "TESTFLIGHT_DB"
 database_name = "minibili-testflight"
-database_id = "REPLACE_WITH_CLOUDFLARE_D1_DATABASE_ID"
+database_id = "0c7e518d-de70-4c80-9b3b-2c3a2727ab4a"
 
 [triggers]
-crons = ["0 * * * *"]
+crons = ["0 23 * * *", "0 0 * * *"]

@@ -1,20 +1,81 @@
-# Local-only example. Copy to .dev.vars for wrangler dev, never commit real secrets.
+# Local-only example. Copy to .dev.vars for local scripts and wrangler dev.
+# Do not commit real secrets.
 
+# Telegram bot token. 同一个 bot 可以同时给股东群和公开群发消息。
 TELEGRAM_BOT_TOKEN=
+
+# Xcode Cloud 构建完成后的实时通知目标。
+# 你现在的流程里，这通常是“股东专属 TG 群组”，因为股东立即可用。
 TELEGRAM_CHAT_ID=
+
+# 可选：如果 TELEGRAM_CHAT_ID 是 Telegram Forum/Supergroup，并且只想发到某个 topic，
+# 填这个 topic 的 message_thread_id。普通群/频道留空。
 TELEGRAM_THREAD_ID=
 
+# 30 天后公开视频时的公开通知目标。
+# 这通常是公开大群，和上面的股东群分开，避免提前给公开用户发通知。
+# 如果只想发频道、不想发大群，可以留空。
 PUBLIC_TELEGRAM_CHAT_ID=
+
+# 可选：公开大群如果是 Forum/Supergroup 并且要发到某个 topic，填这个 topic id。
+# 不需要 topic 就留空。
 PUBLIC_TELEGRAM_THREAD_ID=
 
+# true 时，公开大群通知发送成功后会自动置顶这条消息。
+# bot 必须是该群管理员，并且拥有 Pin messages/置顶消息 权限。
+PUBLIC_TELEGRAM_PIN_MESSAGE=false
+
+# true 表示置顶时不额外通知群成员；false 表示 Telegram 会按群设置发置顶通知。
+PUBLIC_TELEGRAM_PIN_DISABLE_NOTIFICATION=true
+
+# 30 天后公开视频时的公开频道通知目标。
+# bot 必须是频道管理员，并且拥有 Post messages/发布消息 权限。
+# 频道 ID 可以是 @channel_username，也可以是 -100... 数字 ID。
+PUBLIC_TELEGRAM_CHANNEL_ID=
+
+# true 时，公开频道通知发送成功后会自动置顶频道消息。
+# bot 必须是频道管理员，并且拥有 Pin messages/置顶消息 权限。
+PUBLIC_TELEGRAM_CHANNEL_PIN_MESSAGE=false
+
+# true 表示置顶频道消息时不额外通知订阅者。
+PUBLIC_TELEGRAM_CHANNEL_PIN_DISABLE_NOTIFICATION=true
+
+# Xcode Cloud webhook 请求头 x-xcode-webhook-secret 的值。
 XCODE_CLOUD_WEBHOOK_SECRET=
+
+# 本地 Python 回填脚本调用 /admin/public-rollouts/backfill 时使用的管理密钥。
 PUBLIC_ROLLOUT_ADMIN_SECRET=
 
-GITHUB_TOKEN=
+# App Store Connect app resource id，不是 Bundle ID。
+ASC_APP_ID=6753876871
 
+# App Store Connect API key 信息。
 ASC_ISSUER_ID=
 ASC_KEY_ID=
-ASC_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
 
+# 支持真实多行 .p8 私钥，也支持把换行写成 \n。
+ASC_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----
+PASTE_YOUR_REAL_P8_CONTENT_HERE
+-----END PRIVATE KEY-----"
+
+# 股东 TestFlight 外部群组。线上同步会把这个群组排除在“公开目标群组”之外。
+ASC_SHAREHOLDER_GROUP_NAME=股东
+ASC_SHAREHOLDER_GROUP_ID=5f4a732a-5922-4e23-b259-ac59519c65be
+
+# 股东专属群实时通知里显示的 App 名称。
+SHAREHOLDER_APP_NAME=MiniBili-先行版
+
+# 公开大群 30 天后通知里显示的 App 名称。
+PUBLIC_APP_NAME=MiniBili-公测版
+
+# 兼容旧配置的兜底名称。没有设置上面两个名称时才会使用。
+APP_NAME=MiniBili
+
+# 本地 Python 脚本回填 D1 时调用的线上 Worker 地址。
+WORKER_URL=https://your-worker.example.workers.dev
+
+# 本地调试开关。true 时 webhook 请求不会真的发送 Telegram。
 DEBUG_DRY_RUN=true
+
+# App Store Connect 公开同步调试开关。true 时不会真的把 build 加到公开 TestFlight 群组。
 ASC_DRY_RUN=true
