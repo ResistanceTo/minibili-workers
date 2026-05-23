@@ -1,0 +1,19 @@
+{
+  "name": "minibili-workers",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MiniBili Xcode Cloud, Telegram and TestFlight automation worker.",
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/index.js && node --check scripts/backfill-public-rollouts.js && node --check scripts/sync-asc-public-rollouts.js",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply minibili-testflight --local",
+    "db:migrate:remote": "wrangler d1 migrations apply minibili-testflight --remote",
+    "backfill": "node scripts/backfill-public-rollouts.js examples/backfill-public-rollouts.sample.json",
+    "sync:asc": "node scripts/sync-asc-public-rollouts.js --since-days=45"
+  },
+  "devDependencies": {
+    "wrangler": "^4.18.0"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "items": [
+    {
+      "id": "xcode-cloud-build-run-id-or-manual-dev-04",
+      "appId": "6753876871",
+      "ascBuildId": "app-store-connect-build-id",
+      "buildNumber": "99",
+      "workflowName": "测试专员构建",
+      "tagName": "dev-04",
+      "appName": "MiniBili-先行版",
+      "releaseAt": "2026-05-08T15:16:37.850Z",
+      "notes": "1.测试弹幕/n 2.测试性能/n 3.Nuke"
+    }
+  ]
+}

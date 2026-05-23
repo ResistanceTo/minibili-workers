@@ -1,0 +1,23 @@
+name = "minibili-workers"
+main = "src/index.js"
+compatibility_date = "2026-05-23"
+
+[observability]
+enabled = true
+
+[vars]
+APP_NAME = "MiniBili"
+ANNOUNCE_ONLY_SUCCESS = "true"
+ASC_DELAY_DAYS = "30"
+ASC_SHAREHOLDER_GROUP_NAME = "股东"
+PUBLIC_ROLLOUT_LIMIT = "10"
+PUBLIC_ROLLOUT_MAX_ATTEMPTS = "10"
+PUBLIC_ROLLOUT_WORKFLOW_NAMES = "测试专员构建"
+
+[[d1_databases]]
+binding = "TESTFLIGHT_DB"
+database_name = "minibili-testflight"
+database_id = "REPLACE_WITH_CLOUDFLARE_D1_DATABASE_ID"
+
+[triggers]
+crons = ["0 * * * *"]
