@@ -1075,12 +1075,11 @@ async function pinTelegramMessage(env, { chatId, messageId, disableNotification 
 }
 
 function formatPublicRolloutMessage(job, targetGroups) {
-  const groupNames = targetGroups.map((group) => group.attributes?.name ?? group.id).join("、");
   const lines = [
-    `📢 <b>${escapeHtml(job.app_name)} 公开测试版已开放</b>`,
+    `📢 <b>${escapeHtml(job.app_name)} 已同步</b>`,
     "----------------------------------------",
     `<b>对应版本：</b> Build ${escapeHtml(String(job.ci_build_number))}`,
-    `<b>开放范围：</b> ${escapeHtml(groupNames)}`,
+    `<b>开放范围：</b> 全部测试员。`,
     ""
   ];
 
@@ -1094,7 +1093,7 @@ function formatPublicRolloutMessage(job, targetGroups) {
 
 function formatPublicRolloutFailureMessage(job, error) {
   return [
-    `⚠️ <b>${escapeHtml(job.app_name)} 公开测试版同步失败</b>`,
+    `⚠️ <b>${escapeHtml(job.app_name)} 同步失败</b>`,
     "----------------------------------------",
     `<b>对应版本：</b> Build ${escapeHtml(String(job.ci_build_number))}`,
     `<b>任务 ID：</b> ${escapeHtml(job.id)}`,
