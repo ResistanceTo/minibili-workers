@@ -518,6 +518,8 @@ def post_backfill(*, env: dict[str, str], body: dict[str, Any]) -> dict[str, Any
         data=payload,
         headers={
             "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "MiniBili-ASC-D1-Backfill/1.0",
             "x-public-rollout-admin-secret": secret,
         },
         method="POST",

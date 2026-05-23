@@ -208,3 +208,15 @@ node scripts/backfill-public-rollouts.js examples/backfill-public-rollouts.sampl
 ```bash
 npm run dev
 ```
+
+
+当前 D1 表 testflight_public_rollouts.status 主要有这些状态：
+
+状态	含义	后续会不会被 08:00 cron 处理
+SCHEDULED	已登记，等待公开视频。通常表示 build 已经在“股东”群，但还没进公开群，等 due_at 到达后同步。	会
+PROCESSING	08:00 cron 正在处理这条任务。用于防止重复并发执行。	超过 15 分钟未更新会重试
+DONE	已经完成公开同步，或 ASC 里检测到这个 build 已经属于公开群组。	不会
+FAILED	多次同步失败，达到 PUBLIC_ROLLOUT_MAX_ATTEMPTS 上限。	不会
+SKIPPED_EXPIRED	Apple 显示这个 build 已过期，不能再公开视频。	不会
+SKIPPED_PROCESSING_STATE	Apple 显示这个 build 还不是 VALID，比如还在处理或状态异常。	不会
+SKIPPED_NOT_SHAREHOLDER	这个 build 既不在公开群，也不在股东群。说明它还不是“股东先行版本”，不能开始 30 天倒计时。	不会

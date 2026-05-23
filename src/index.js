@@ -25,6 +25,14 @@ export default {
       return handlePublicRolloutBackfill(request, rawBody, env);
     }
 
+    if (url.pathname === "/admin/public-rollouts/sync-now") {
+      return handleAdminTask(request, env, "sync-now", () => syncLatestAscBuildsToD1(env));
+    }
+
+    if (url.pathname === "/admin/public-rollouts/publish-due") {
+      return handleAdminTask(request, env, "publish-due", () => publishDuePublicRollouts(env));
+    }
+
     if (env.XCODE_CLOUD_WEBHOOK_SECRET) {
       const receivedSecret = request.headers.get(XCODE_CLOUD_SECRET_HEADER) ?? "";
       // 安全升级：用 Web Crypto API 对比哈希，彻底杜绝时序攻击风险
@@ -64,7 +72,7 @@ export default {
       });
     }
 
-    if (shouldSkipEmptyTaggedSuccess(summary)) {
+    if (shouldSkipEmptyTaggedSuccess(summary, env)) {
       return jsonResponse({
         ok: true,
         skipped: true,
@@ -259,14 +267,8 @@ async function maybeCreatePublicRolloutJob(payload, summary, env) {
 }
 
 async function handlePublicRolloutBackfill(request, rawBody, env) {
-  if (!env.PUBLIC_ROLLOUT_ADMIN_SECRET) {
-    return jsonResponse({ ok: false, message: "PUBLIC_ROLLOUT_ADMIN_SECRET is not configured" }, 500);
-  }
-
-  const receivedSecret = request.headers.get(PUBLIC_ROLLOUT_ADMIN_SECRET_HEADER) ?? "";
-  if (!await safeCompare(receivedSecret, env.PUBLIC_ROLLOUT_ADMIN_SECRET)) {
-    return jsonResponse({ ok: false, message: "Unauthorized" }, 401);
-  }
+  const unauthorized = await verifyPublicRolloutAdmin(request, env);
+  if (unauthorized) return unauthorized;
 
   if (!env.TESTFLIGHT_DB) {
     return jsonResponse({ ok: false, message: "TESTFLIGHT_DB binding is missing" }, 500);
@@ -297,6 +299,27 @@ async function handlePublicRolloutBackfill(request, rawBody, env) {
 
   const success = results.filter((item) => item.ok).length;
   return jsonResponse({ ok: success === results.length, total: results.length, success, results });
+}
+
+async function handleAdminTask(request, env, taskName, task) {
+  const unauthorized = await verifyPublicRolloutAdmin(request, env);
+  if (unauthorized) return unauthorized;
+
+  await task();
+  return jsonResponse({ ok: true, task: taskName });
+}
+
+async function verifyPublicRolloutAdmin(request, env) {
+  if (!env.PUBLIC_ROLLOUT_ADMIN_SECRET) {
+    return jsonResponse({ ok: false, message: "PUBLIC_ROLLOUT_ADMIN_SECRET is not configured" }, 500);
+  }
+
+  const receivedSecret = request.headers.get(PUBLIC_ROLLOUT_ADMIN_SECRET_HEADER) ?? "";
+  if (!await safeCompare(receivedSecret, env.PUBLIC_ROLLOUT_ADMIN_SECRET)) {
+    return jsonResponse({ ok: false, message: "Unauthorized" }, 401);
+  }
+
+  return null;
 }
 
 async function normalizeBackfillEntry(entry, env) {
@@ -439,8 +462,9 @@ async function upsertPublicRolloutJob({ env, id, appId, buildRunId, buildNumber,
   return { dueAt };
 }
 
-function shouldSkipEmptyTaggedSuccess(summary) {
-  return summary.status === "SUCCEEDED"
+function shouldSkipEmptyTaggedSuccess(summary, env) {
+  return env.SKIP_EMPTY_TAGGED_SUCCESS === "true"
+    && summary.status === "SUCCEEDED"
     && summary.tagName
     && summary.whatsNewSource === "fallback"
     && !summary.whatsNewLog;
